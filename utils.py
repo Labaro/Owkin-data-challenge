@@ -1,21 +1,21 @@
 import pandas as pd
 import numpy as np
-from sklearn import preprocessing
-from sklearn.model_selection import train_test_split
-from sksurv.util import Surv
 
 
-def get_data():
+def get_data(r, cl):
     """Read radiomics, clinical and output csv files and returns data after being homogenize.
+
+    :parameter str r: path to radiomics file
+    :parameter str cl: path to clinical data file
 
     :return pd.Dataframe X: samples features.
     :return pd.DataFrame y: output.
     """
-    radiomics = pd.read_csv('train/features/radiomics.csv')
+    radiomics = pd.read_csv(r)
     df_radio = pd.DataFrame(radiomics.values[2:, 1:].astype(float),
                             columns=radiomics.values[0, 1:])
 
-    clinical = pd.read_csv('train/features/clinical_data.csv')
+    clinical = pd.read_csv(cl)
     clinical_array = clinical.values
 
     # Homogenization of Histology feature:
@@ -25,17 +25,17 @@ def get_data():
         clinical[name] = (hist == name).astype(int)
     del clinical['Histology']
 
+    del clinical['age']
+
     # Homogenization of SourceDataset feature:
     source = clinical_array[:, 4]
     for name in ['l1', 'l2']:
         clinical[name] = (source == name).astype(int)
     del clinical['SourceDataset']
 
-    del clinical['PatientID']
-
     # Concatenation with radiomics file:
     X = pd.DataFrame(np.hstack([clinical.values, df_radio.values]),
-                     columns=np.concatenate((clinical.columns, df_radio.columns)))
+                     columns=np.concatenate((clinical.columns, df_radio.columns))).set_index('PatientID')
 
     # Homogenization of output file:
     y = pd.read_csv('train/output.csv')
@@ -47,11 +47,15 @@ def get_data():
 
 def separate_data(X, y, separator=None):
     """Separate the data depending on histology or dataset source.
+    :parameter pd.DataFrame X: features set
+    :parameter pd.DataFrame y: prediction set
     :parameter separator: optional, str or None (default=None).
                             - 'Histology' > return one DataFrame per different histology
                             - 'SourceDataset' > return one Dataframe per different dataset source
-    :returns X, y: list of """
-    Xs, ys = [], []
+
+    :returns X, y, idxs: list of pd.Dataframe, pd.DataFrame and array-like. The indexes identifying the position of the
+    sample in the original set X."""
+    Xs, ys, idxs = [], [], []
     if separator is None:
         return [X], [y]
     elif separator == 'Histology':
@@ -60,44 +64,54 @@ def separate_data(X, y, separator=None):
             index = np.flatnonzero(X[name])
             Xs.append(X.iloc[index].drop(names, axis=1))
             ys.append(y.iloc[index])
+            idxs.append(index)
     elif separator == 'SourceDataset':
         names = ['l1', 'l2']
         for name in names:
             index = np.flatnonzero(X[name])
             Xs.append(X.iloc[index].drop(names, axis=1))
             ys.append(y.iloc[index])
-    return Xs, ys
+            idxs.append(index)
+    return Xs, ys, idxs
 
 
-def select_features(X, features=None):
-    output = []
-    if features is None:
-        output = X
-    else:
-        for x in X:
-            x.drop(np.setdiff1d(x.columns, features), axis=1)
-            output.append(x)
-    return output
+def to_pd(index, index_test, T_pred):
+    """Transform the prediction into a proper Dataframe object to be used in cindex
+    :parameter list index: PatientID
+    :parameter list index_test: list of list. Contains index of position into the original file.
+    :parameter list T_pred: list of list. Contains the predicted survival time."""
+    N = len(index)
+    T, I = np.zeros(N), np.zeros(N, dtype=int)
+    for i, idx in enumerate(index_test):
+        I[idx] = [index[j] for j in index_test[i]]
+        T[idx] = T_pred[i]
+    idx = np.argwhere(T == 0)
+    T = np.delete(T, idx)
+    I = np.delete(I, idx)
+    empty = np.empty(N - len(idx))
+    empty[:] = np.NAN
+    y_pred = pd.DataFrame({'PatientID': I, 'SurvivalTime': T, 'Event': empty}).set_index('PatientID')
+    return y_pred
 
 
-def encode_data(Xs, ys, normalized=False):
-    output_X, output_y = [], []
-    for x in Xs:
-        if normalized:
-            scaler = preprocessing.StandardScaler()
-            output_X.append(scaler.fit_transform(x.values))
-        else:
-            output_X.append(x.values)
-    for y in ys:
-        output_y.append(Surv().from_arrays(y.values[:, 1], y.values[:, 0]))
-    return output_X, output_y
-
-
-def split(features, test_size=None, separator=None, normalized=False):
-    X, y = get_data()
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size)
-    Xs_train, ys_train = separate_data(X_train, y_train, separator=separator)
-    Xs_test, ys_test = separate_data(X_test, y_test, separator=separator)
-    Xs_train, ys_train = encode_data(select_features(Xs_train, features=features), ys_train, normalized=normalized)
-    Xs_test, ys_test = encode_data(select_features(Xs_test, features=features), ys_test, normalized=normalized)
-    return Xs_train, Xs_test, ys_train, ys_test
+def LeverageScoresSampler(A, k, theta):
+    """Deterministic column sampling
+    :parameter array-like A: matrix of features that need to reduced.
+    :parameter int k: parameter to choose the k first singular vector ordered in non increasing order
+    :parameter flot theta: energy of the final reduction. Close to k is best."""
+    u, s, vh = np.linalg.svd(A)
+    Vk = vh.T[:k + 1]
+    l = np.apply_along_axis(lambda x: np.linalg.norm(x), 0, Vk)
+    idx = np.argsort(l)[::-1]
+    l = l[idx]
+    L, c = 0, 0
+    for c in range(A.shape[1] - 1):
+        L += l[c]
+        if L > theta:
+            break
+    if c < k:
+        c = k
+    S = np.zeros((A.shape[1], c))
+    for i in range(c):
+        S[idx[i], i] = 1
+    return S, idx[:c + 1]
